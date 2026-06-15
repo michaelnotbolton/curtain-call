@@ -12,11 +12,15 @@ dist
 dist-ssr
 *.local
 
+# macOS metadata (exFAT / AppleDouble)
+._*
+.DS_Store
+__MACOSX
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
 .idea
-.DS_Store
 *.suo
 *.ntvs*
 *.njsproj
