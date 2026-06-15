@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.curtaincall.scraper</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Volumes/X10 Pro/repos/curtain-call/scripts/weekly_refresh.sh</string>
+  </array>
+
+  <!-- Run every Sunday at 3:00 AM -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>0</integer>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <!-- Run missed jobs when the machine wakes up -->
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Volumes/X10 Pro/repos/curtain-call/scripts/refresh.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Volumes/X10 Pro/repos/curtain-call/scripts/refresh.log</string>
+
+  <!-- Keep environment vars for git and npm -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/michaelbooton</string>
+    <key>npm_config_registry</key>
+    <string>https://registry.npmjs.org</string>
+    <key>npm_config_always_auth</key>
+    <string>false</string>
+    <key>npm_config_cache</key>
+    <string>/tmp/npm-cache</string>
+  </dict>
+</dict>
+</plist>
