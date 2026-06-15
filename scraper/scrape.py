@@ -23,11 +23,13 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
+# Allow running as `python3 scraper/scrape.py` or `python3 -m scraper.scrape`
+sys.path.insert(0, str(Path(__file__).parent))
 from venues_dallas import VENUES
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -193,6 +195,49 @@ PLAYWRIGHT_SELECTORS = [
 ]
 
 
+_NOISE_PHRASES = re.compile(
+    r"subscribe|mailing list|support our|our mission|our story|equity.{0,5}diversity"
+    r"|summer camp|pagination|season ticket|donate|membership|contact us|about us"
+    r"|upcoming shows?[\s!]*$|past shows?[\s!]*$|current season[\s!]*$|next season[\s!]*$"
+    r"|newsletter|gift card|ticket package|volunteer|internship|audition|youth program"
+    r"|follow us|social media|copyright|all rights|privacy policy"
+    r"|anniversary season|mainstage season|announcing\s|join us\b|up next"
+    r"|there is always|birthday party for|honoring legacy|living our"
+    r"|news\s*$|season!$|\d+(st|nd|rd|th)\s+season"
+    r"|for a great .{1,10} season|first tuesdays?$|upcoming.*shows?\s+in",
+    re.IGNORECASE,
+)
+_DATE_ONLY = re.compile(
+    r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d",
+    re.IGNORECASE,
+)
+_DATE_RANGE = re.compile(
+    r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{1,2})[^a-z]*"
+    r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{4})",
+    re.IGNORECASE,
+)
+_PLAYWRIGHT_ATTR = re.compile(r"^by\s+[A-Z]", re.IGNORECASE)
+_NAV_SINGLE_WORD = re.compile(
+    r"^(community|events?|tickets?|home|about|news|season|subscribe|donate|shop)$",
+    re.IGNORECASE,
+)
+
+
+def _is_likely_show_title(text: str) -> bool:
+    """Return False for nav headings, org boilerplate, and attribution strings."""
+    if not text or len(text) < 4 or len(text) > 100:
+        return False
+    if _NOISE_PHRASES.search(text):
+        return False
+    if _DATE_ONLY.match(text) or _DATE_RANGE.match(text):
+        return False
+    if _PLAYWRIGHT_ATTR.match(text):
+        return False
+    if _NAV_SINGLE_WORD.match(text.strip()):
+        return False
+    return True
+
+
 def extract_css_patterns(html: str, venue: dict) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     shows = []
@@ -206,14 +251,16 @@ def extract_css_patterns(html: str, venue: dict) -> list[dict]:
         for art in articles:
             show = _extract_from_article(art, venue["url"])
             if show:
-                shows.append(show)
+                show["title"] = _split_concat_date(show["title"])
+                if _is_likely_show_title(show["title"]):
+                    shows.append(show)
         return shows
 
     # Fallback: look for title-like elements and pair with nearby dates
     titles = _find_by_selectors(soup, TITLE_SELECTORS)
     for title_el in titles[:20]:  # cap at 20 to avoid grabbing nav links
-        text = title_el.get_text(strip=True)
-        if len(text) < 3 or len(text) > 120:
+        text = _split_concat_date(title_el.get_text(strip=True))
+        if not _is_likely_show_title(text):
             continue
 
         # Look for a nearby date
@@ -288,6 +335,19 @@ def _extract_from_article(art, base_url: str) -> Optional[dict]:
         "ticket_url": ticket_url,
         "description": None,
     }
+
+
+_CONCAT_DATE = re.compile(
+    r"([A-Za-z])(January|February|March|April|May|June|July|August|September|October|November|December)\b"
+)
+
+
+def _split_concat_date(title: str) -> str:
+    """Fix titles like 'Shrek the MusicalJune 25 - July 12' → 'Shrek the Musical'."""
+    m = _CONCAT_DATE.search(title)
+    if m:
+        return title[: m.start(2)].strip()
+    return title
 
 
 def _find_by_selectors(soup, selectors: list):
