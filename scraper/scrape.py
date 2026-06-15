@@ -28,17 +28,36 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
-# Allow running as `python3 scraper/scrape.py` or `python3 -m scraper.scrape`
-sys.path.insert(0, str(Path(__file__).parent))
-from venues_dallas import VENUES
+SCRAPER_DIR = Path(__file__).parent
+REPO_ROOT = SCRAPER_DIR.parent
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-OLLAMA_MODEL = "qwen2.5:7b"
-OLLAMA_URL = "http://localhost:11434/api/generate"
-REQUEST_DELAY = 2.5  # seconds between requests (be a good citizen)
-REQUEST_TIMEOUT = 15
-OUTPUT_FILE = Path(__file__).parent.parent / "public" / "data" / "shows-dallas.json"
+def _load_config() -> dict:
+    defaults = {
+        "ollama_model": "qwen2.5:7b",
+        "ollama_url": "http://localhost:11434/api/generate",
+        "request_delay": 2.5,
+        "request_timeout": 15,
+        "stale_show_threshold": 0,
+        "min_title_pass_rate": 0.5,
+        "resynth_cooldown_days": 7,
+    }
+    cfg_path = SCRAPER_DIR / "config.json"
+    if cfg_path.exists():
+        with open(cfg_path) as f:
+            defaults.update(json.load(f))
+    return defaults
+
+CONFIG = _load_config()
+
+OLLAMA_MODEL = CONFIG["ollama_model"]
+OLLAMA_URL = CONFIG["ollama_url"]
+REQUEST_DELAY = CONFIG["request_delay"]
+REQUEST_TIMEOUT = CONFIG["request_timeout"]
+OUTPUT_FILE = REPO_ROOT / "public" / "data" / "shows-dallas.json"
+RUN_LOG = SCRAPER_DIR / "runs.jsonl"
+VENUES_FILE = SCRAPER_DIR / "venues_dallas.json"
 CITY = "Dallas"
 
 HEADERS = {
@@ -51,6 +70,12 @@ HEADERS = {
 }
 
 log = logging.getLogger(__name__)
+
+
+def load_venues(status: str = "active") -> list[dict]:
+    with open(VENUES_FILE) as f:
+        data = json.load(f)
+    return [v for v in data["venues"] if v.get("status") == status]
 
 
 # ── Fetching ─────────────────────────────────────────────────────────────────
@@ -470,24 +495,31 @@ def scrape_venue(venue: dict) -> tuple[list[dict], str]:
     return [], "no-match"
 
 
+def _append_run_log(entry: dict):
+    with open(RUN_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
 def run(target_venue: Optional[str] = None, dry_run: bool = False):
-    venues = VENUES
+    venues = load_venues(status="active")
     if target_venue:
-        venues = [v for v in VENUES if target_venue.lower() in v["name"].lower()]
+        venues = [v for v in venues if target_venue.lower() in v["name"].lower()]
         if not venues:
-            print(f"No venue matching '{target_venue}'. Known venues:")
-            for v in VENUES:
+            all_venues = load_venues(status="active")
+            print(f"No active venue matching '{target_venue}'. Known venues:")
+            for v in all_venues:
                 print(f"  {v['name']}")
             sys.exit(1)
 
     if dry_run:
         print(f"Would scrape {len(venues)} venues:")
         for v in venues:
-            print(f"  {v['name']}: {v['url']}")
+            print(f"  [{v['level']}] {v['name']}: {v['url']}")
         return
 
     all_shows = []
     stats = {"schema.org": 0, "css-patterns": 0, "ollama": 0, "no-match": 0, "fetch-failed": 0}
+    run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     log.info("Starting scrape of %d venues", len(venues))
     ollama_ok = _is_ollama_running()
@@ -504,19 +536,29 @@ def run(target_venue: Optional[str] = None, dry_run: bool = False):
 
         for show in shows:
             show["venue"] = venue["name"]
+            show["venue_level"] = venue.get("level")
+            show["venue_zip"] = venue.get("zip")
             show["source_url"] = venue["url"]
             show["extraction_method"] = method
             show["id"] = _make_id(show["title"], venue["name"])
         all_shows.extend(shows)
 
         log.info("  → %d show(s) via %s", len(shows), method)
+        _append_run_log({
+            "ts": run_ts,
+            "venue_id": venue["id"],
+            "venue": venue["name"],
+            "shows": len(shows),
+            "method": method,
+            "level": venue.get("level"),
+        })
 
         if i < len(venues) - 1:
             time.sleep(REQUEST_DELAY)
 
     output = {
         "city": CITY,
-        "scraped_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "scraped_at": run_ts,
         "show_count": len(all_shows),
         "venue_count": len(venues),
         "stats": stats,

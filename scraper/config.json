@@ -1,0 +1,10 @@
+{
+  "ollama_model": "qwen2.5:7b",
+  "ollama_url": "http://localhost:11434/api/generate",
+  "request_delay": 2.5,
+  "request_timeout": 15,
+
+  "stale_show_threshold": 0,
+  "min_title_pass_rate": 0.5,
+  "resynth_cooldown_days": 7
+}

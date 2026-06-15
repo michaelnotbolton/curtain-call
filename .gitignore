@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# Scraper runtime files (local only)
+scraper/runs.jsonl
+scraper/__pycache__/
+
 # macOS metadata (exFAT / AppleDouble)
 ._*
 .DS_Store
