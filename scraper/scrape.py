@@ -20,7 +20,7 @@ import sys
 import time
 import logging
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin
@@ -516,7 +516,7 @@ def run(target_venue: Optional[str] = None, dry_run: bool = False):
 
     output = {
         "city": CITY,
-        "scraped_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "scraped_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "show_count": len(all_shows),
         "venue_count": len(venues),
         "stats": stats,
