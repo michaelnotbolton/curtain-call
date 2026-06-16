@@ -237,42 +237,95 @@ def strategy_tcg(city: str, state: str) -> list[str]:
     return list(found)
 
 
-def strategy_eventbrite(city: str, state: str) -> list[str]:
+def strategy_tca(city: str, state: str) -> list[str]:
     """
-    Eventbrite organizer pages for theater events in the metro.
-    Eventbrite shows the organizer's website — we extract those as venue candidates.
+    Texas Commission on the Arts — funded theater organizations.
+    High signal-to-noise: TCA grantees actively produce work and are vetted.
+    Tries several known TCA directory/grantee page paths.
     """
-    # Search Eventbrite for theater events in the city
-    url = (
-        f"https://www.eventbrite.com/d/{state.lower()}--{city.lower()}/theater/?format=list"
-    )
-    html = fetch(url)
-    if not html:
-        log.warning("[eventbrite] Could not fetch Eventbrite search for %s %s", city, state)
-        return []
+    candidates = [
+        "https://www.arts.texas.gov/resources/texas-arts-organizations/",
+        "https://www.arts.texas.gov/grants/grant-recipients/",
+        "https://www.arts.texas.gov/initiatives/arts-organizations/",
+        "https://www.arts.texas.gov/resources/find-an-organization/",
+    ]
 
-    soup = BeautifulSoup(html, "html.parser")
-    found = set()
-
-    # Look for organizer website links in event cards
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if not href.startswith("http") or "eventbrite.com" in href:
+    for url in candidates:
+        html = fetch(url)
+        if not html:
             continue
-        root = _root_url(href)
-        if not _is_skippable(root):
-            found.add(root)
 
-    log.info("[eventbrite] %d candidate URLs from Eventbrite theater events", len(found))
-    return list(found)
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Look for theater/performing arts org links — TCA pages list orgs
+        # with their website links inline; filter to TX orgs where possible
+        found = set()
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if not href.startswith("http") or "arts.texas.gov" in href:
+                continue
+            root = _root_url(href)
+            if not _is_skippable(root):
+                found.add(root)
+
+        if found:
+            log.info("[tca] %d candidate URLs from %s", len(found), url)
+            return list(found)
+
+        log.info("[tca] No links found at %s — trying next path", url)
+
+    log.warning("[tca] Could not find a working TCA directory page — may need URL update")
+    return []
+
+
+def strategy_recursive(city: str, state: str) -> list[str]:
+    """
+    Follow outbound links from known active venues.
+    Theater communities cross-link heavily: partners, co-productions, season sponsors,
+    "recommended" pages. One hop from known venues surfaces organic neighbors.
+    """
+    data = load_venues_json(city)
+    active = [v for v in data["venues"] if v.get("status") == "active"]
+    known = _known_domains(data)
+    found: dict[str, str] = {}  # url → source venue name
+
+    for venue in active:
+        # Prefer homepage over the show-listing URL to get the full site nav
+        url = venue.get("homepage") or venue["url"]
+        log.info("[recursive] Scanning links from: %s", venue["name"])
+        html = fetch(url)
+        if not html:
+            time.sleep(CONFIG["request_delay"])
+            continue
+
+        soup = BeautifulSoup(html, "html.parser")
+        count = 0
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if not href.startswith("http"):
+                continue
+            root = _root_url(href)
+            d = _domain(root)
+            if d not in known and root not in found and not _is_skippable(root):
+                found[root] = venue["name"]
+                count += 1
+
+        log.info("[recursive] %d new candidate link(s) from %s", count, venue["name"])
+        time.sleep(CONFIG["request_delay"])
+
+    log.info("[recursive] Total: %d candidate URLs from %d known venues",
+             len(found), len(active))
+    return list(found.keys())
 
 
 # Registry: name → strategy function. Add new strategies here.
+# Eventbrite removed: JS-rendered, requests gets empty shell page.
 STRATEGIES: dict[str, Callable[[str, str], list[str]]] = {
-    "ddg":        strategy_ddg,
-    "aact":       strategy_aact,
-    "tcg":        strategy_tcg,
-    "eventbrite": strategy_eventbrite,
+    "ddg":       strategy_ddg,
+    "aact":      strategy_aact,
+    "tcg":       strategy_tcg,
+    "tca":       strategy_tca,
+    "recursive": strategy_recursive,
 }
 
 
