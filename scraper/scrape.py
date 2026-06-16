@@ -565,30 +565,50 @@ def extract_with_ollama(html: str, venue: dict) -> list[dict]:
         return []
 
 
+# ── PDF detection ─────────────────────────────────────────────────────────────
+
+def _find_pdf_links(html: str, base_url: str) -> list[str]:
+    """Return absolute URLs of any .pdf links on the page."""
+    soup = BeautifulSoup(html, "html.parser")
+    pdfs = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.lower().endswith(".pdf"):
+            full = href if href.startswith("http") else urljoin(base_url, href)
+            pdfs.append(full)
+    return pdfs
+
+
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
-def scrape_venue(venue: dict) -> tuple[list[dict], str]:
-    """Returns (shows, extraction_method). Shows may be empty."""
+def scrape_venue(venue: dict) -> tuple[list[dict], str, list[str]]:
+    """Returns (shows, extraction_method, pdf_urls)."""
     html = fetch_page(venue["url"])
     if not html:
-        return [], "fetch-failed"
+        return [], "fetch-failed", []
 
     # 1. schema.org
     shows = extract_schema_org(html, venue)
     if shows:
-        return shows, "schema.org"
+        return shows, "schema.org", []
 
     # 2. CSS heuristics
     shows = extract_css_patterns(html, venue)
     if shows:
-        return shows, "css-patterns"
+        return shows, "css-patterns", []
 
     # 3. Ollama
     shows = extract_with_ollama(html, venue)
     if shows:
-        return shows, "ollama"
+        return shows, "ollama", []
 
-    return [], "no-match"
+    # All tiers failed — check if show info may be in linked PDFs
+    pdf_links = _find_pdf_links(html, venue["url"])
+    if pdf_links:
+        log.info("  PDF(s) detected — may contain show info: %s", pdf_links)
+        return [], "pdf-detected", pdf_links
+
+    return [], "no-match", []
 
 
 def _append_run_log(entry: dict):
@@ -614,7 +634,7 @@ def run(target_venue: Optional[str] = None, dry_run: bool = False):
         return
 
     all_shows = []
-    stats = {"schema.org": 0, "css-patterns": 0, "ollama": 0, "no-match": 0, "fetch-failed": 0}
+    stats = {"schema.org": 0, "css-patterns": 0, "ollama": 0, "pdf-detected": 0, "no-match": 0, "fetch-failed": 0}
     run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     log.info("Starting scrape of %d venues", len(venues))
@@ -627,7 +647,7 @@ def run(target_venue: Optional[str] = None, dry_run: bool = False):
 
     for i, venue in enumerate(venues):
         log.info("[%d/%d] %s", i + 1, len(venues), venue["name"])
-        shows, method = scrape_venue(venue)
+        shows, method, pdf_links = scrape_venue(venue)
         stats[method] = stats.get(method, 0) + 1
 
         is_k12 = venue.get("level") == "k12"
@@ -650,14 +670,17 @@ def run(target_venue: Optional[str] = None, dry_run: bool = False):
         all_shows.extend(filtered)
 
         log.info("  → %d show(s) via %s", len(shows), method)
-        _append_run_log({
+        log_entry = {
             "ts": run_ts,
             "venue_id": venue["id"],
             "venue": venue["name"],
-            "shows": len(shows),
+            "shows": len(filtered),
             "method": method,
             "level": venue.get("level"),
-        })
+        }
+        if pdf_links:
+            log_entry["pdf_links"] = pdf_links
+        _append_run_log(log_entry)
 
         if i < len(venues) - 1:
             time.sleep(REQUEST_DELAY)
@@ -676,9 +699,10 @@ def run(target_venue: Optional[str] = None, dry_run: bool = False):
         json.dump(output, f, indent=2, ensure_ascii=False)
 
     print(f"\n✓ {len(all_shows)} shows from {len(venues)} venues → {OUTPUT_FILE}")
-    print(f"  schema.org: {stats['schema.org']} venues  |  "
+    print(f"  schema.org: {stats['schema.org']}  |  "
           f"css-patterns: {stats['css-patterns']}  |  "
           f"ollama: {stats['ollama']}  |  "
+          f"pdf-detected: {stats['pdf-detected']}  |  "
           f"no-match: {stats['no-match']}  |  "
           f"failed: {stats['fetch-failed']}")
 
