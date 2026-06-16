@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo } from 'react'
+import ShowMap from './ShowMap.jsx'
 
 const C = {
   gold: '#C9A84C',
@@ -12,6 +13,7 @@ const C = {
 export default function ShowSearch() {
   const [data, setData] = useState(null)     // null = loading, false = error
   const [query, setQuery] = useState('')
+  const [view, setView] = useState('list')   // 'list' | 'map'
 
   useEffect(() => {
     const url = `${import.meta.env.BASE_URL}data/shows-dallas.json`
@@ -138,11 +140,38 @@ export default function ShowSearch() {
         {data && data.show_count === 0 && <EmptyDataState />}
         {data && data.show_count > 0 && (
           <>
+            {/* List / Map toggle */}
+            <div className="fade-in delay-400" style={{ display: 'flex', gap: '8px', marginBottom: '24px' }}>
+              {['list', 'map'].map((v) => (
+                <button
+                  key={v}
+                  onClick={() => setView(v)}
+                  style={{
+                    padding: '6px 18px',
+                    borderRadius: '20px',
+                    border: `1px solid ${view === v ? C.gold : 'rgba(201,168,76,0.25)'}`,
+                    background: view === v ? 'rgba(201,168,76,0.12)' : 'transparent',
+                    color: view === v ? C.gold : `${C.cream}50`,
+                    fontSize: '13px',
+                    fontFamily: 'var(--font-body)',
+                    cursor: 'pointer',
+                    transition: 'all 0.15s',
+                    textTransform: 'capitalize',
+                  }}
+                >
+                  {v === 'list' ? '☰ List' : '⬡ Map'}
+                </button>
+              ))}
+            </div>
+
             {shows.length === 0 ? (
               <NoResultsState query={query} onClear={() => setQuery('')} />
+            ) : view === 'map' ? (
+              <ShowMap shows={shows} />
             ) : (
               <ResultsList shows={shows} query={query} total={data.show_count} />
             )}
+
             {scraped && (
               <p
                 style={{
