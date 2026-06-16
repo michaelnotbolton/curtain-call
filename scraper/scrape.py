@@ -20,10 +20,11 @@ import sys
 import time
 import logging
 import argparse
+import urllib.robotparser
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -71,6 +72,24 @@ HEADERS = {
 
 log = logging.getLogger(__name__)
 
+# ── robots.txt cache ──────────────────────────────────────────────────────────
+
+_robots_cache: dict[str, urllib.robotparser.RobotFileParser] = {}
+
+def _robots_allows(url: str) -> bool:
+    """Return False if robots.txt disallows our UA from this URL. Cached per domain."""
+    parsed = urlparse(url)
+    root = f"{parsed.scheme}://{parsed.netloc}"
+    if root not in _robots_cache:
+        rp = urllib.robotparser.RobotFileParser()
+        rp.set_url(f"{root}/robots.txt")
+        try:
+            rp.read()
+        except Exception:
+            rp.allow_all = True
+        _robots_cache[root] = rp
+    return _robots_cache[root].can_fetch(HEADERS["User-Agent"], url)
+
 
 def load_venues(status: str = "active") -> list[dict]:
     with open(VENUES_FILE) as f:
@@ -81,18 +100,21 @@ def load_venues(status: str = "active") -> list[dict]:
 # ── Fetching ─────────────────────────────────────────────────────────────────
 
 def fetch_page(url: str) -> Optional[str]:
+    if not _robots_allows(url):
+        log.warning("robots.txt disallows %s — skipping", url)
+        return None
     try:
         resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.text
     except requests.exceptions.HTTPError as e:
-        log.warning(f"HTTP {e.response.status_code} fetching {url}")
+        log.warning("HTTP %s fetching %s", e.response.status_code, url)
     except requests.exceptions.ConnectionError:
-        log.warning(f"Connection error fetching {url}")
+        log.warning("Connection error fetching %s", url)
     except requests.exceptions.Timeout:
-        log.warning(f"Timeout fetching {url}")
+        log.warning("Timeout fetching %s", url)
     except Exception as e:
-        log.warning(f"Error fetching {url}: {e}")
+        log.warning("Error fetching %s: %s", url, e)
     return None
 
 
@@ -132,22 +154,45 @@ def _parse_schema_event(item: dict, base_url: str) -> Optional[dict]:
     start = item.get("startDate", "")
     end = item.get("endDate", "")
 
-    location = item.get("location", {})
-    if isinstance(location, list):
-        location = location[0] if location else {}
+    offers = item.get("offers", {})
+    if isinstance(offers, list):
+        offers = offers[0] if offers else {}
 
-    url = item.get("url", "") or item.get("offers", {}).get("url", "")
-    if url and not url.startswith("http"):
-        url = urljoin(base_url, url)
+    ticket_url = item.get("url", "") or offers.get("url", "")
+    if ticket_url and not ticket_url.startswith("http"):
+        ticket_url = urljoin(base_url, ticket_url)
+
+    # schema.org price: may be numeric or string; "0" means free
+    price = None
+    raw_price = offers.get("price")
+    currency = offers.get("priceCurrency", "USD")
+    if raw_price is not None:
+        raw_price = str(raw_price).strip()
+        if raw_price in ("0", "0.00", ""):
+            price = "Free"
+        elif raw_price:
+            price = f"${raw_price}" if currency == "USD" else f"{raw_price} {currency}"
+
+    # availability field signals public vs. private
+    avail = offers.get("availability", "")
+    event_status = item.get("eventStatus", "")
+    if "Private" in avail or "Unavailable" in avail:
+        public = False
+    elif ticket_url or price is not None:
+        public = True
+    else:
+        public = None
 
     return {
         "title": name,
-        "playwright": None,  # schema.org rarely includes this
+        "playwright": None,
         "director": _coerce_str(item.get("director")),
         "start_date": _parse_date(start),
         "end_date": _parse_date(end),
         "showtimes": None,
-        "ticket_url": url or None,
+        "ticket_url": ticket_url or None,
+        "price": price,
+        "public": public,
         "description": (item.get("description", "") or "")[:300] or None,
     }
 
@@ -210,6 +255,36 @@ TICKET_SELECTORS = [
     "a.ticket-link",
     ".tribe-events-cal-links a",
 ]
+
+PRICE_SELECTORS = [
+    ".tribe-events-cost",
+    ".event-cost",
+    ".ticket-price",
+    ".price",
+    "[class*='cost']",
+    "[class*='price']",
+]
+
+_PRICE_RE = re.compile(r"\$\d+(?:\.\d{2})?(?:\s*[-–]\s*\$\d+(?:\.\d{2})?)?|free|pay what you (?:can|will)|suggested donation", re.IGNORECASE)
+_CLOSED_RE = re.compile(r"\binvitation only\b|\bby invitation\b|\bstudent showcase\b|\bfamily and friends\b|\bnot open to the public\b", re.IGNORECASE)
+
+def _extract_price(soup_el) -> Optional[str]:
+    for sel in PRICE_SELECTORS:
+        el = soup_el.select_one(sel)
+        if el:
+            text = el.get_text(strip=True)
+            m = _PRICE_RE.search(text)
+            if m:
+                return m.group(0).strip()
+    return None
+
+def _infer_public(ticket_url: Optional[str], price: Optional[str], description: Optional[str]) -> Optional[bool]:
+    desc = (description or "").lower()
+    if _CLOSED_RE.search(desc):
+        return False
+    if ticket_url or price is not None:
+        return True
+    return None
 
 PLAYWRIGHT_SELECTORS = [
     ".playwright",
@@ -305,6 +380,8 @@ def extract_css_patterns(html: str, venue: dict) -> list[dict]:
                 ticket_url = href if href.startswith("http") else urljoin(venue["url"], href)
                 break
 
+        price = _extract_price(parent)
+
         shows.append({
             "title": text,
             "playwright": None,
@@ -313,6 +390,8 @@ def extract_css_patterns(html: str, venue: dict) -> list[dict]:
             "end_date": None,
             "showtimes": date_text,
             "ticket_url": ticket_url,
+            "price": price,
+            "public": _infer_public(ticket_url, price, None),
             "description": None,
         })
 
@@ -350,6 +429,8 @@ def _extract_from_article(art, base_url: str) -> Optional[dict]:
             ticket_url = href if href.startswith("http") else urljoin(base_url, href)
             break
 
+    price = _extract_price(art)
+
     return {
         "title": title,
         "playwright": playwright_text,
@@ -358,6 +439,8 @@ def _extract_from_article(art, base_url: str) -> Optional[dict]:
         "end_date": None,
         "showtimes": date_text,
         "ticket_url": ticket_url,
+        "price": price,
+        "public": _infer_public(ticket_url, price, None),
         "description": None,
     }
 
@@ -394,9 +477,13 @@ Return a JSON array of show objects. Each object must have these keys:
 - end_date (string "YYYY-MM-DD" or null)
 - showtimes (string like "Thursdays-Saturdays 8pm, Sundays 3pm" or null)
 - ticket_url (full URL string or null)
+- price (string like "$15", "$10-25", "Free", "Pay what you can" — or null if not mentioned)
+- public (true if open to the public, false if invitation-only/student showcase/family only, null if unclear)
 - description (brief string or null)
 
 Include only upcoming theatrical productions. Skip past shows, navigation links, staff bios, classes, or events that are not performances.
+Set public=false if the page uses language like "invitation only", "student showcase", "family and friends", or "not open to the public".
+Set public=true if tickets are available for purchase or the show is clearly advertised to the public.
 If no shows are found, return an empty JSON array: []
 Return ONLY valid JSON. No explanation, no markdown, no code fences.
 
@@ -459,7 +546,16 @@ def extract_with_ollama(html: str, venue: dict) -> list[dict]:
 
         shows = json.loads(raw)
         if isinstance(shows, list):
-            return [s for s in shows if isinstance(s, dict) and s.get("title")]
+            out = []
+            for s in shows:
+                if not isinstance(s, dict) or not s.get("title"):
+                    continue
+                # Normalise public field — model may return string "true"/"false"
+                pub = s.get("public")
+                if isinstance(pub, str):
+                    s["public"] = True if pub.lower() == "true" else (False if pub.lower() == "false" else None)
+                out.append(s)
+            return out
         return []
     except json.JSONDecodeError as e:
         log.warning("Ollama returned invalid JSON for %s: %s", venue["name"], e)
@@ -534,6 +630,8 @@ def run(target_venue: Optional[str] = None, dry_run: bool = False):
         shows, method = scrape_venue(venue)
         stats[method] = stats.get(method, 0) + 1
 
+        is_k12 = venue.get("level") == "k12"
+        filtered = []
         for show in shows:
             show["venue"] = venue["name"]
             show["venue_level"] = venue.get("level")
@@ -541,7 +639,15 @@ def run(target_venue: Optional[str] = None, dry_run: bool = False):
             show["source_url"] = venue["url"]
             show["extraction_method"] = method
             show["id"] = _make_id(show["title"], venue["name"])
-        all_shows.extend(shows)
+            pub = show.get("public")
+            if pub is False:
+                log.info("    Dropping (not public): %s", show["title"])
+                continue
+            if is_k12 and pub is None:
+                log.info("    Dropping k12 (public unconfirmed): %s", show["title"])
+                continue
+            filtered.append(show)
+        all_shows.extend(filtered)
 
         log.info("  → %d show(s) via %s", len(shows), method)
         _append_run_log({

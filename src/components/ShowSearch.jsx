@@ -243,29 +243,40 @@ function ShowCard({ show }) {
           )}
         </div>
       </div>
-      {show.ticket_url && (
-        <a
-          href={show.ticket_url}
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{
-            flexShrink: 0,
-            fontSize: '13px',
-            color: C.gold,
-            border: `1px solid rgba(201,168,76,0.35)`,
-            borderRadius: '6px',
-            padding: '7px 14px',
-            textDecoration: 'none',
-            whiteSpace: 'nowrap',
-            transition: 'background-color 0.15s',
-          }}
-          onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'rgba(201,168,76,0.1)')}
-          onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
-        >
-          Tickets ↗
-        </a>
-      )}
-      <ExtractionBadge method={show.extraction_method} />
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '6px', flexShrink: 0 }}>
+        {show.ticket_url ? (
+          <a
+            href={show.ticket_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{
+              fontSize: '13px',
+              color: C.gold,
+              border: `1px solid rgba(201,168,76,0.35)`,
+              borderRadius: '6px',
+              padding: '7px 14px',
+              textDecoration: 'none',
+              whiteSpace: 'nowrap',
+              transition: 'background-color 0.15s',
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'rgba(201,168,76,0.1)')}
+            onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+          >
+            {show.price ? `${show.price} · Tickets ↗` : 'Tickets ↗'}
+          </a>
+        ) : show.price ? (
+          <span style={{ fontSize: '13px', color: C.gold, opacity: 0.8 }}>{show.price}</span>
+        ) : null}
+        {show.public === null && (
+          <span
+            title="We found this show but couldn't confirm it's open to the public"
+            style={{ fontSize: '10px', color: `${C.cream}40`, whiteSpace: 'nowrap', cursor: 'help' }}
+          >
+            ⚠ Availability unconfirmed
+          </span>
+        )}
+        <ExtractionBadge method={show.extraction_method} />
+      </div>
     </div>
   )
 }
