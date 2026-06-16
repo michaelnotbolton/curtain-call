@@ -71,15 +71,34 @@ VALID_LEVELS = [
     "small_professional", "regional_professional", "touring",
 ]
 
-# Domains that are never theater venue homepages
+# Domains that are never theater venue homepages.
+# Includes ticketing platforms (orgs *use* them but they aren't venues),
+# marketing/CRM tools, CDNs, staging hosts, social media, and major review sites.
 SKIP_DOMAINS = frozenset({
+    # Social / video
     "facebook.com", "twitter.com", "x.com", "instagram.com", "youtube.com",
-    "linkedin.com", "tiktok.com", "pinterest.com",
+    "linkedin.com", "tiktok.com", "pinterest.com", "vimeo.com",
+    # Ticketing platforms (orgs list shows here but these aren't the venue homepage)
     "eventbrite.com", "ticketmaster.com", "axs.com", "seatgeek.com",
-    "todaytix.com", "goldstar.com",
+    "todaytix.com", "goldstar.com", "ovationtix.com", "onthestage.tickets",
+    "ticketstothecity.com", "ticketdfw.com", "showclix.com",
+    "brownpapertickets.com", "etix.com", "ludus.com",
+    # Search / maps / review
     "google.com", "apple.com", "yelp.com", "tripadvisor.com",
-    "wikipedia.org", "wikimedia.org",
-    "amazon.com", "maps.apple.com",
+    "maps.apple.com", "maps.google.com", "bingmaps.com",
+    # Reference / encyclopedia
+    "wikipedia.org", "wikimedia.org", "wikia.com",
+    # E-commerce / generic web
+    "amazon.com", "shopify.com", "squarespace.com", "wix.com",
+    # Marketing / CRM / email platforms
+    "list-manage.com", "mailchimp.com", "constantcontact.com",
+    "prospect2.com", "hubspot.com", "sailthru.com",
+    # Photo / media hosting
+    "pixieset.com", "smugmug.com", "flickr.com",
+    # WordPress / CMS infrastructure (staging hosts, not venue sites)
+    "wpengine.com", "wordpress.com", "pantheonsite.io",
+    # Misc platforms found to produce false positives
+    "lexus.com",
 })
 
 
@@ -110,6 +129,11 @@ def _domain(url: str) -> str:
 def _is_skippable(url: str) -> bool:
     d = _domain(url)
     return any(d == skip or d.endswith("." + skip) for skip in SKIP_DOMAINS)
+
+
+def _is_known_or_subdomain(d: str, known: set[str]) -> bool:
+    """True if d is a known venue domain or a subdomain of one (e.g. staging.venue.org)."""
+    return d in known or any(d.endswith("." + k) for k in known)
 
 
 # ── Discovery strategies ──────────────────────────────────────────────────────
@@ -237,45 +261,91 @@ def strategy_tcg(city: str, state: str) -> list[str]:
     return list(found)
 
 
+_TCA_THEATER_RE = re.compile(
+    r"theatre|theater|play|drama|musical|stage|performing arts",
+    re.IGNORECASE,
+)
+
+# Known DFW metro cities to filter TCA grant rows. Add suburbs as needed.
+_DFW_CITIES = frozenset({
+    "dallas", "fort worth", "plano", "irving", "garland", "arlington",
+    "richardson", "addison", "mckinney", "frisco", "denton", "allen",
+    "carrollton", "lewisville", "grand prairie", "mesquite", "rowlett",
+    "flower mound", "cedar hill", "duncanville", "desoto", "burleson",
+    "mansfield", "euless", "bedford", "hurst", "colleyville", "grapevine",
+    "southlake", "keller", "weatherford", "waxahachie", "ennis", "corsicana",
+})
+
+
 def strategy_tca(city: str, state: str) -> list[str]:
     """
-    Texas Commission on the Arts — funded theater organizations.
-    High signal-to-noise: TCA grantees actively produce work and are vetted.
-    Tries several known TCA directory/grantee page paths.
-    """
-    candidates = [
-        "https://www.arts.texas.gov/resources/texas-arts-organizations/",
-        "https://www.arts.texas.gov/grants/grant-recipients/",
-        "https://www.arts.texas.gov/initiatives/arts-organizations/",
-        "https://www.arts.texas.gov/resources/find-an-organization/",
-    ]
+    Texas Commission on the Arts current grant recipients.
 
-    for url in candidates:
-        html = fetch(url)
-        if not html:
+    Scrapes the TCA grants table (no external links — org names + cities only),
+    filters to theater orgs in the target metro, then does a targeted DDG name
+    search for each org to find their official website. TCA-funded = real, vetted,
+    actively producing orgs, so signal quality is high even with the extra hop.
+    """
+    html = fetch("https://www.arts.texas.gov/current-grants/")
+    if not html:
+        log.warning("[tca] Could not fetch TCA grants page")
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table")
+    if not table:
+        log.warning("[tca] No grants table found on page — structure may have changed")
+        return []
+
+    # Table columns: Fiscal Year | Name | City | Region | Program | Description | Award
+    metro_orgs: list[tuple[str, str]] = []
+    for row in table.find_all("tr")[1:]:
+        cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+        if len(cells) < 6:
+            continue
+        _, name, org_city, _, program, description, *_ = cells
+        if org_city.lower() not in _DFW_CITIES:
+            continue
+        if not _TCA_THEATER_RE.search(f"{program} {description}"):
+            continue
+        metro_orgs.append((name, org_city))
+
+    # Deduplicate by name (same org may have multiple grant rows in same FY)
+    seen_names: set[str] = set()
+    metro_orgs = [(n, c) for n, c in metro_orgs if not (n in seen_names or seen_names.add(n))]
+
+    log.info("[tca] %d unique DFW theater orgs found in TCA grant table", len(metro_orgs))
+
+    from urllib.parse import unquote as _unquote
+    found: set[str] = set()
+
+    for name, org_city in metro_orgs:
+        query = f'"{name}" {org_city} theater official site'
+        search_url = f"https://html.duckduckgo.com/html/?{urlencode({'q': query})}"
+        html_search = fetch(search_url, extra_headers={"Accept": "text/html"})
+        if not html_search:
+            time.sleep(CONFIG["request_delay"])
             continue
 
-        soup = BeautifulSoup(html, "html.parser")
-
-        # Look for theater/performing arts org links — TCA pages list orgs
-        # with their website links inline; filter to TX orgs where possible
-        found = set()
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if not href.startswith("http") or "arts.texas.gov" in href:
+        s = BeautifulSoup(html_search, "html.parser")
+        for a in s.select("a.result__url, a.result__a, .result__extras__url"):
+            href = a.get("href", "").strip()
+            if "/l/?" in href:
+                m = re.search(r"uddg=([^&]+)", href)
+                if m:
+                    href = _unquote(m.group(1))
+            if not href.startswith("http"):
                 continue
             root = _root_url(href)
             if not _is_skippable(root):
                 found.add(root)
+                log.info("[tca] %s → %s", name, root)
+                break  # first non-skippable result per org
 
-        if found:
-            log.info("[tca] %d candidate URLs from %s", len(found), url)
-            return list(found)
+        time.sleep(CONFIG["request_delay"])
 
-        log.info("[tca] No links found at %s — trying next path", url)
-
-    log.warning("[tca] Could not find a working TCA directory page — may need URL update")
-    return []
+    log.info("[tca] %d candidate URLs from TCA + DDG name search", len(found))
+    return list(found)
 
 
 def strategy_recursive(city: str, state: str) -> list[str]:
@@ -306,7 +376,7 @@ def strategy_recursive(city: str, state: str) -> list[str]:
                 continue
             root = _root_url(href)
             d = _domain(root)
-            if d not in known and root not in found and not _is_skippable(root):
+            if not _is_known_or_subdomain(d, known) and root not in found and not _is_skippable(root):
                 found[root] = venue["name"]
                 count += 1
 
@@ -470,8 +540,8 @@ def discover(city: str, state: str, strategy_names: list[str], limit: Optional[i
     for url, found_by in candidates.items():
         if limit and checked >= limit:
             break
-        if _domain(url) in known:
-            log.info("Skip (known): %s", url)
+        if _is_known_or_subdomain(_domain(url), known):
+            log.info("Skip (known/subdomain): %s", url)
             continue
 
         log.info("[%s] Classifying: %s", found_by, url)

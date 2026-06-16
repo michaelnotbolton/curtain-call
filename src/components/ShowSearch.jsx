@@ -276,6 +276,14 @@ function ShowCard({ show }) {
           </span>
         )}
         <ExtractionBadge method={show.extraction_method} />
+        <a
+          href={`mailto:me@michaelbooton.dev?subject=${encodeURIComponent(`Correction: ${show.title} at ${show.venue}`)}&body=${encodeURIComponent(`Show: ${show.title}\nVenue: ${show.venue}\n\nWhat's wrong:\n`)}`}
+          style={{ fontSize: '10px', color: `${C.cream}25`, textDecoration: 'none', whiteSpace: 'nowrap' }}
+          onMouseEnter={(e) => (e.currentTarget.style.color = `${C.cream}60`)}
+          onMouseLeave={(e) => (e.currentTarget.style.color = `${C.cream}25`)}
+        >
+          Report
+        </a>
       </div>
     </div>
   )
