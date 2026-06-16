@@ -4,9 +4,10 @@ Curtain Call — Dallas show scraper
 Fetches shows from Dallas-area theater websites and outputs public/data/shows-dallas.json
 
 Extraction pipeline (in order, first success wins):
-  1. schema.org JSON-LD  — free, near-perfect where it exists
+  1. schema.org JSON-LD    — free, structured, near-perfect where it exists
   2. CSS pattern heuristics — common WordPress/Squarespace theater templates
-  3. Ollama local model   — fallback for unstructured pages (requires Ollama running)
+  3. PDF extraction         — pdfplumber text → Ollama; catches season brochures/order forms
+  4. Ollama on HTML         — LLM fallback for unstructured pages (requires Ollama running)
 
 Usage:
   python3 scraper/scrape.py            # full run
@@ -28,6 +29,12 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+
+try:
+    import pdfplumber
+    _PDFPLUMBER_AVAILABLE = True
+except ImportError:
+    _PDFPLUMBER_AVAILABLE = False
 
 SCRAPER_DIR = Path(__file__).parent
 REPO_ROOT = SCRAPER_DIR.parent
@@ -565,6 +572,96 @@ def extract_with_ollama(html: str, venue: dict) -> list[dict]:
         return []
 
 
+# ── PDF extraction ────────────────────────────────────────────────────────────
+
+# Filenames that are clearly administrative, not show listings
+_PDF_SKIP_RE = re.compile(
+    r"accessibility|privacy|policy|statement|contract|application|employment"
+    r"|donation|sponsor|audition|press.?release|newsletter|map|parking|directions",
+    re.IGNORECASE,
+)
+
+def _fetch_pdf_bytes(url: str) -> Optional[bytes]:
+    if not _robots_allows(url):
+        log.warning("robots.txt disallows PDF %s", url)
+        return None
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+        resp.raise_for_status()
+        if "pdf" not in resp.headers.get("content-type", "").lower():
+            return None
+        return resp.content
+    except Exception as e:
+        log.warning("Could not fetch PDF %s: %s", url, e)
+        return None
+
+
+def _pdf_to_text(pdf_bytes: bytes) -> Optional[str]:
+    if not _PDFPLUMBER_AVAILABLE:
+        return None
+    import io
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            pages = [p.extract_text() or "" for p in pdf.pages]
+            text = "\n".join(pages).strip()
+            return text if len(text) > 50 else None
+    except Exception as e:
+        log.warning("pdfplumber error: %s", e)
+        return None
+
+
+def extract_from_pdfs(pdf_links: list[str], venue: dict) -> list[dict]:
+    """Try each PDF link in order; return first successful extraction."""
+    if not _is_ollama_running():
+        log.warning("Ollama not running — skipping PDF extraction for %s", venue["name"])
+        return []
+
+    for url in pdf_links:
+        filename = url.rsplit("/", 1)[-1]
+        if _PDF_SKIP_RE.search(filename):
+            log.info("  Skipping administrative PDF: %s", filename)
+            continue
+
+        log.info("  Trying PDF: %s", filename)
+        pdf_bytes = _fetch_pdf_bytes(url)
+        if not pdf_bytes:
+            continue
+
+        text = _pdf_to_text(pdf_bytes)
+        if not text:
+            log.info("  PDF appears image-based (no text extracted): %s", filename)
+            # TODO: vision model fallback (llava) for image PDFs
+            continue
+
+        log.info("  Extracted %d chars from PDF, sending to Ollama", len(text))
+        prompt = EXTRACTION_PROMPT.format(
+            venue_name=venue["name"],
+            url=url,
+            html=text[:6000],
+        )
+        try:
+            resp = requests.post(
+                OLLAMA_URL,
+                json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False,
+                      "options": {"temperature": 0.1}},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            raw = resp.json().get("response", "").strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            shows = json.loads(raw)
+            if isinstance(shows, list):
+                shows = [s for s in shows if isinstance(s, dict) and s.get("title")]
+            if shows:
+                log.info("  PDF yielded %d show(s)", len(shows))
+                return shows
+        except Exception as e:
+            log.warning("  Ollama error on PDF %s: %s", filename, e)
+
+    return []
+
+
 # ── PDF detection ─────────────────────────────────────────────────────────────
 
 def _find_pdf_links(html: str, base_url: str) -> list[str]:
@@ -597,15 +694,21 @@ def scrape_venue(venue: dict) -> tuple[list[dict], str, list[str]]:
     if shows:
         return shows, "css-patterns", []
 
-    # 3. Ollama
-    shows = extract_with_ollama(html, venue)
-    if shows:
-        return shows, "ollama", []
-
-    # All tiers failed — check if show info may be in linked PDFs
+    # 3. PDF extraction — season brochures often have richer data than the HTML
     pdf_links = _find_pdf_links(html, venue["url"])
     if pdf_links:
-        log.info("  PDF(s) detected — may contain show info: %s", pdf_links)
+        shows = extract_from_pdfs(pdf_links, venue)
+        if shows:
+            return shows, "pdf", pdf_links
+        # PDFs found but extraction failed — log them and fall through
+        log.info("  PDF(s) detected but not extracted: %s", pdf_links)
+
+    # 4. Ollama on HTML
+    shows = extract_with_ollama(html, venue)
+    if shows:
+        return shows, "ollama", pdf_links
+
+    if pdf_links:
         return [], "pdf-detected", pdf_links
 
     return [], "no-match", []
@@ -634,7 +737,7 @@ def run(target_venue: Optional[str] = None, dry_run: bool = False):
         return
 
     all_shows = []
-    stats = {"schema.org": 0, "css-patterns": 0, "ollama": 0, "pdf-detected": 0, "no-match": 0, "fetch-failed": 0}
+    stats = {"schema.org": 0, "css-patterns": 0, "pdf": 0, "ollama": 0, "pdf-detected": 0, "no-match": 0, "fetch-failed": 0}
     run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     log.info("Starting scrape of %d venues", len(venues))
@@ -701,6 +804,7 @@ def run(target_venue: Optional[str] = None, dry_run: bool = False):
     print(f"\n✓ {len(all_shows)} shows from {len(venues)} venues → {OUTPUT_FILE}")
     print(f"  schema.org: {stats['schema.org']}  |  "
           f"css-patterns: {stats['css-patterns']}  |  "
+          f"pdf: {stats['pdf']}  |  "
           f"ollama: {stats['ollama']}  |  "
           f"pdf-detected: {stats['pdf-detected']}  |  "
           f"no-match: {stats['no-match']}  |  "
